@@ -1,0 +1,260 @@
+#version 450
+
+#extension GL_GOOGLE_include_directive : enable
+#include "../config.h"
+
+#extension GL_NV_mesh_shader : enable
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_vote : require
+
+#define GROUP_SIZE    WARP_SIZE
+
+layout(local_size_x = GROUP_SIZE) in;
+layout(triangles, max_vertices = NVMESHLET_VERTEX_COUNT, max_primitives = NVMESHLET_PRIMITIVE_COUNT) out;
+
+void decodeMeshlet(uvec4 meshletDesc, out uint vertMax, out uint primMax, out uint vertBegin, out uint primBegin)
+{
+    vertBegin = (meshletDesc.z & 0xFFFFF) * NVMESHLET_VERTEX_ALIGNMENT;
+    primBegin = (meshletDesc.w & 0xFFFFF) * NVMESHLET_PRIM_ALIGNMENT;
+    vertMax = (meshletDesc.x >> 24);
+    primMax = (meshletDesc.y >> 24);
+}
+
+struct SceneData {
+    mat4  viewProjMatrix;
+    mat4  viewMatrix;
+    mat4  viewMatrixIT;
+
+    vec4  viewPos;
+    vec4  viewDir;
+
+    vec4  wLightPos;
+
+    ivec2 viewport;
+    vec2  viewportf;
+
+    vec2  viewportTaskCull;
+    int   colorize;
+    int   _pad0;
+
+    vec4  wClipPlanes[NUM_CLIPPING_PLANES];
+};
+
+// must match cadscene!
+struct ObjectData {
+    mat4 worldMatrix;
+    mat4 worldMatrixIT;
+    mat4 objectMatrix;
+    vec4 bboxMin;
+    vec4 bboxMax;
+    vec3 _pad0;
+    float winding;
+    vec4 color;
+};
+
+struct CullStats {
+    uint  tasksInput;
+    uint  tasksOutput;
+    uint  meshletsInput;
+    uint  meshletsOutput;
+    uint  trisInput;
+    uint  trisOutput;
+    uint  attrInput;
+    uint  attrOutput;
+};
+
+
+
+#if USE_PER_GEOMETRY_VIEWS
+uvec4 geometryOffsets = uvec4(0, 0, 0, 0);
+#else
+layout(push_constant) uniform pushConstant {
+    uvec4     geometryOffsets;
+};
+#endif
+
+layout(std140, binding = 0, set = 0) uniform sceneBuffer {
+    SceneData scene;
+};
+layout(std430, binding = 1, set = 0) buffer statsBuffer {
+    CullStats stats;
+};
+
+layout(std140, binding = 0, set = 1) uniform objectBuffer {
+    ObjectData object;
+};
+
+layout(std430, binding = 0, set = 2) readonly buffer meshletDescBuffer {
+    uvec4 meshletDescs[];
+};
+layout(std430, binding = 1, set = 2) readonly buffer primIndexBuffer {
+    uvec2 primIndices[];
+};
+
+layout(std430, binding = 2, set = 2) readonly buffer vertexBufferObject {
+    float vbo[];
+};
+
+layout(std430, binding = 5, set = 2) readonly buffer textureBufferObject {
+    vec2 texbo[];
+};
+
+layout(std430, binding = 3, set = 2) readonly buffer attributeBufferObject {
+    float abo[];
+};
+
+layout(std430, binding = 4, set = 2)  readonly buffer indexBufferObject {
+    uint16_t ibo[];
+};
+
+
+//layout(binding = 4, set = 2)  uniform usamplerBuffer texIbo;
+
+//layout(std430, binding = 5, set = 2)  buffer texCoordBufferObject {
+//    vec2 texbo[];
+//};
+//layout(binding = 2, set = 2)  uniform samplerBuffer  texVbo;
+
+//layout(binding = 3, set = 2)  uniform samplerBuffer  texAbo;
+
+////////////////////////////////////////////////////////////
+// INPUT
+
+// If you work from fixed vertex definitions and don't need dynamic 
+// format conversions by texture formats, or don't mind
+// creating multiple shader permutations, you may want to
+// use ssbos here, instead of tbos for a bit more performance.
+
+vec3 getPosition(uint vidx) {
+    uint idx = vidx * 3;
+    return vec3(vbo[idx], vbo[idx + 1], vbo[idx + 2]);
+    //return vec3(vbo[vidx * 3], vbo[vidx * 3 + 1], vbo[vidx * 3 + 2]);
+    //return texelFetch(texVbo, int(vidx)).xyz;
+}
+
+vec3 getNormal(uint vidx) {
+    uint idx = vidx * 3;
+    return vec3(abo[idx], abo[idx + 1], abo[idx + 2]);
+}
+
+vec2 getExtra(uint vidx, uint xtra) {
+    uint idx = vidx * 2;
+    return texbo[vidx];
+    //return vec2(texbo[idx], texbo[ idx + 1]);
+}
+
+// only for tight packing case, 8 indices are loaded per thread
+#define NVMSH_PRIMITIVE_INDICES_RUNS  ((NVMESHLET_PRIMITIVE_COUNT * 3 + GROUP_SIZE * 8 - 1) / (GROUP_SIZE * 8))
+
+// processing loops
+#define NVMSH_VERTEX_RUNS     ((NVMESHLET_VERTEX_COUNT + GROUP_SIZE - 1) / GROUP_SIZE)
+#define NVMSH_PRIMITIVE_RUNS  ((NVMESHLET_PRIMITIVE_COUNT + GROUP_SIZE - 1) / GROUP_SIZE)
+
+#if 1
+#define nvmsh_writePackedPrimitiveIndices4x8NV writePackedPrimitiveIndices4x8NV
+#else
+#define nvmsh_writePackedPrimitiveIndices4x8NV(idx, topology) {\
+        gl_PrimitiveIndicesNV[ (idx) + 0 ] = (NVMSH_PACKED4X8_GET((topology), 0)); \
+        gl_PrimitiveIndicesNV[ (idx) + 1 ] = (NVMSH_PACKED4X8_GET((topology), 1)); \
+        gl_PrimitiveIndicesNV[ (idx) + 2 ] = (NVMSH_PACKED4X8_GET((topology), 2)); \
+        gl_PrimitiveIndicesNV[ (idx) + 3 ] = (NVMSH_PACKED4X8_GET((topology), 3));} 
+#endif
+
+
+
+
+// Custom vertex output block
+layout(location = 0) out PerVertexData 
+{
+    vec3  outNormal;
+    vec3  outColor;
+    vec3  outLightVec;
+    vec3  outViewVec;
+    vec2 outTexCoord;
+
+} v_out[];
+
+//light position
+vec3 lPos = vec3(0.0);
+
+/////////////////////////////////////////////////
+// MESH INPUT
+
+#define USE_TASK_STAGE 1
+
+#if USE_TASK_STAGE
+taskNV in Task{
+  uint    baseID;
+  uint8_t subIDs[GROUP_SIZE];
+} IN;
+// gl_WorkGroupID.x runs from [0 .. parentTask.gl_TaskCountNV - 1]
+uint meshletID = IN.baseID + IN.subIDs[gl_WorkGroupID.x];
+#else
+uint meshletID = gl_WorkGroupID.x;
+#endif
+uint laneID = gl_LocalInvocationID.x;
+
+void main() {
+    // decode meshletDesc
+    uvec4 desc = meshletDescs[meshletID + geometryOffsets.x];
+    uint vertMax;
+    uint primMax;
+    uint vertBegin;
+    uint primBegin;
+    decodeMeshlet(desc, vertMax, primMax, vertBegin, primBegin);
+    uint primCount = primMax + 1;
+    uint vertCount = vertMax + 1;
+
+    for (uint loop = 0; loop < uint(NVMSH_VERTEX_RUNS); ++loop) {
+
+        uint vert = laneID + loop * GROUP_SIZE;
+        uint v = min(vert, vertMax);
+
+        // does not work
+        //uint vidx = texelFetch(texIbo, int(vertBegin + min(v, vertMax))).x;
+        //uint vidx = texelFetch(texIbo, int(vertBegin+v + geometryOffsets.z)).x + geometryOffsets.w;
+        uint vidx = ibo[int(vertBegin + v + geometryOffsets.z)] + geometryOffsets.w;
+        //uint vidx = ibo[int(vertBegin + v + geometryOffsets.z)] + geometryOffsets.w;
+        //uint vidx = indices[v];
+        vec4 pos = scene.viewProjMatrix * object.worldMatrix * vec4(getPosition(vidx), 1.0);
+        pos.y = -pos.y;
+        gl_MeshVerticesNV[vert].gl_Position = pos;
+        v_out[vert].outNormal = mat3(scene.viewProjMatrix) * mat3(object.worldMatrix) * getNormal(vidx).xyz;
+        v_out[vert].outColor = vec3(0.1, 0.1, 0.1);
+        v_out[vert].outLightVec = lPos - pos.xyz;
+        v_out[vert].outViewVec = -pos.xyz;
+        v_out[vert].outTexCoord = getExtra(vidx, 1);
+
+    }
+
+    uint readBegin = primBegin / 8 + geometryOffsets.y;
+    uint readIndex = primCount * 3 - 1;
+    uint readMax = readIndex / 8;
+
+    for (uint i = 0; i < uint(NVMSH_PRIMITIVE_INDICES_RUNS); i++) {
+        uint read = laneID + i * GROUP_SIZE;
+        uint readUsed = min(read, readMax);
+
+        //uvec2 topology = texelFetch(texPrim, int(readBegin + readUsed)).rg;
+        uvec2 topology = primIndices[readBegin + readUsed];
+
+        // use a built-in function, we took special care before when 
+        // sizing the meshlets to ensure we don't exceed the 
+        // gl_PrimitiveIndicesNV array here
+
+        writePackedPrimitiveIndices4x8NV(readUsed * 8 + 0, topology.x);
+        writePackedPrimitiveIndices4x8NV(readUsed * 8 + 4, topology.y);
+
+    }
+
+    if (laneID == 0) {
+        gl_PrimitiveCountNV = primCount;
+    }
+
+  
+}
